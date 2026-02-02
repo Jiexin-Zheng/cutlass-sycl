@@ -66,6 +66,11 @@ if (CUTLASS_ENABLE_SYCL)
       cute_tutorial_xe_gemm_slm
       xe_gemm_slm.cpp
     )
+
+    cutlass_example_add_executable(
+      cute_tutorial_slm_copy
+      slm_copy.cpp
+    )
   endif()
 
   if (SYCL_NVIDIA_TARGET)

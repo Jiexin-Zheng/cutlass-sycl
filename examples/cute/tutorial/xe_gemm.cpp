@@ -83,6 +83,12 @@ gemm_device(ATensor   const& A,         // (M,K)
   auto wg_tile = mma.tile_mnk();
   auto wg_coord = make_coord(wg_m, wg_n, 0);
 
+  /*allocate shared local memory*/
+  auto smem = compat::local_mem<half_t[size(select<0,1>(wg_tile))]>();
+  auto BLK_M = size<0>(wg_tile);
+  auto BLK_N = size<1>(wg_tile);
+  Tensor STensor = make_tensor(make_smem_ptr(smem), make_layout(make_shape(BLK_M, BLK_N), make_stride(_1{}, BLK_M)));
+
   Tensor gA = local_tile(cA, select<0,2>(wg_tile), make_coord(wg_m,_));  // (BLK_M,BLK_K,k)
   Tensor gB = local_tile(cB, select<1,2>(wg_tile), make_coord(wg_n,_));  // (BLK_N,BLK_K,k)
   Tensor gC = local_tile(cC, wg_tile, wg_coord, Step<_1,_1, X>{});       // (BLK_M,BLK_N)
@@ -92,11 +98,19 @@ gemm_device(ATensor   const& A,         // (M,K)
   auto copy_b = make_block_2d_copy_B(mma, B);
   auto copy_c = make_block_2d_copy_D(mma, C);
 
+  auto copy_X = make_block_2d_copy_D(mma, make_tensor(make_gmem_ptr(static_cast<half_t*>(nullptr)), C.layout()));
+  // SLM store 
+  using Atom = Copy_Atom<UniversalCopy<half_t>, half_t>;
+  using Tiler_MN = typename decltype(copy_X)::Tiler_MN;
+  using TVLayout = typename decltype(copy_X)::TiledLayout_TV;
+  auto slm_store = TiledCopy<Atom, TVLayout, Tiler_MN>{};
+  auto thr_slm_store = slm_store.get_slice(local_id);
+
   /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
   auto thr_mma    =    mma.get_slice(local_id);
   auto thr_copy_a = copy_a.get_slice(local_id);
   auto thr_copy_b = copy_b.get_slice(local_id);
-
+  auto thr_copy_X = copy_X.get_slice(local_id);
   /* Register fragments for MMA */
   auto tCrA = thr_mma.partition_sg_fragment_A(gA(_,_,0));
   auto tCrB = thr_mma.partition_sg_fragment_B(gB(_,_,0));
@@ -110,8 +124,13 @@ gemm_device(ATensor   const& A,         // (M,K)
   Tensor tBgB = thr_copy_b.partition_S(gB);
 
   /* Partition C */
-  Tensor tCrC = partition_fragment_C(mma, select<0,1>(wg_tile));
+  auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(wg_tile)));
+  // auto r16 = make_tensor<half_t>(layout(tCrC));
+  auto r16 = thr_copy_X.partition_sg_fragment_S(gC);
   Tensor tCgC = thr_mma.partition_C(gC);    /* also matches copy_c's source layout */
+
+  Tensor tOrO = thr_slm_store.retile_S(r16);
+  Tensor tOsO = thr_slm_store.partition_D(STensor);
 
   /* Create prefetch TiledCopy instances */
   auto prefetch_a = make_block_2d_prefetch(copy_a);
@@ -172,6 +191,42 @@ gemm_device(ATensor   const& A,         // (M,K)
 
   /* Write C to global memory */
   copy(copy_c, tCrC, tCgC);
+  // for(int i =0; i < size(tOrO); i++) {
+  //   tOrO[i] = (half_t)tCrC[i];
+  // }
+  reorder(tCrC, r16);
+  copy(slm_store, tOrO, tOsO);
+  // #if defined(__SYCL_DEVICE_ONLY__) && defined(__INTEL_LLVM_COMPILER)
+  // for(int i = 0; i < size(tOsO); i++) {
+  //   uint32_t smem_ptr = cast_smem_ptr_to_uint(&tOsO[i]);
+  //   auto& data_vec = *reinterpret_cast<intel::vector_t<uint32_t, 1>*>(&tOrO[i]);
+  //   asm volatile(
+  //     "{\n"
+  //     ".decl DST v_type=G type=ud num_elts=16 align=wordx32 alias=<%1, 0> \n"
+  //     ".decl SRC v_type=G type=f  num_elts=16 align=wordx32 alias=<%0, 0>\n"
+  //     "lsc_store.slm (M1, 16) flat[DST]:a32 SRC:d32 \n"
+  //     "}\n" ::"rw"(data_vec),
+  //     "rw"(smem_ptr)
+  //   );
+  // }
+  // #endif
+  barrier_arrive(SPIRVScope::ScopeWorkgroup, SPIRVMemorySemantics::SemanticsRelease | SPIRVMemorySemantics::SemanticsWGMemory);
+  barrier_wait(SPIRVScope::ScopeWorkgroup, SPIRVMemorySemantics::SemanticsAcquire | SPIRVMemorySemantics::SemanticsWGMemory);
+  
+  if(cute::thread0()) {
+    // print("\n");
+    // print(copy_c);
+    // print("\n");
+    // print(tCrC);
+    // print("\n");
+    for(int i = 0; i < BLK_M; i++) {
+      for(int j = 0; j < BLK_N; j++) {
+        print("["); print(C(i, j)); print(", ");
+        print(STensor(i, j)); print("] ");
+      }
+      print("\n");
+    }
+  }
 }
 
 template <typename TA, typename TB, typename TC>
@@ -209,9 +264,9 @@ choose_tiled_mma(ATensor const& A, BTensor const& B, CTensor const&)
   using _K = conditional_t<use_1x_dpas_per_k,
                            C<op.K>, C<op.K*2>>;
 
-  using WGTile = Shape<_256, _256, _K>;                               // 256x256 WG tile size
-  using SGLayout8x4 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;  // 8x4 SG tiling, n-major
-  using SGLayout4x8 = Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>;  // 4x8 SG tiling, n-major
+  using WGTile = Shape<_32, _32, _K>;                               // 256x256 WG tile size
+  using SGLayout8x4 = Layout<Shape<_2, _2, _1>, Stride<_2, _1, _0>>;  // 8x4 SG tiling, n-major
+  using SGLayout4x8 = Layout<Shape<_2, _2, _1>, Stride<_2, _1, _0>>;  // 4x8 SG tiling, n-major
   using SGLayout = conditional_t<use_4x8_sg, SGLayout4x8, SGLayout8x4>;
 
   using MMA = typename TiledMMAHelper<MMA_Atom<decltype(op)>, Layout<WGTile>, SGLayout>::TiledMMA;
@@ -337,7 +392,7 @@ test_case(sycl::queue &Q, int m, int n, int k)
 
   if (ok) {
     // Test performance:
-    const int timing_iterations = 100;
+    const int timing_iterations = 0;
     GPU_Clock timer;
 
     timer.start();
@@ -394,74 +449,74 @@ int main(int argc, char** argv)
   sycl::queue Q = compat::get_default_queue();
 
   // Native compute
-  test_case<tfloat32_t, tfloat32_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<tfloat32_t, tfloat32_t, float, 'R', 'C'>(Q, m, n, k);
-  test_case<tfloat32_t, tfloat32_t, float, 'C', 'R'>(Q, m, n, k);
+  // test_case<tfloat32_t, tfloat32_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<tfloat32_t, tfloat32_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<tfloat32_t, tfloat32_t, float, 'C', 'R'>(Q, m, n, k);
 
-  test_case<half_t, half_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<half_t, half_t, float, 'R', 'C'>(Q, m, n, k);
-  test_case<half_t, half_t, float, 'C', 'R'>(Q, m, n, k);
+  test_case<half_t, half_t, float, 'R', 'R'>(Q, 32, 32, 32);
+  // test_case<half_t, half_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<half_t, half_t, float, 'C', 'R'>(Q, m, n, k);
 
-  test_case<bfloat16_t, bfloat16_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<bfloat16_t, bfloat16_t, float, 'R', 'C'>(Q, m, n, k);
-  test_case<bfloat16_t, bfloat16_t, float, 'C', 'R'>(Q, m, n, k);
+  // test_case<bfloat16_t, bfloat16_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<bfloat16_t, bfloat16_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<bfloat16_t, bfloat16_t, float, 'C', 'R'>(Q, m, n, k);
 
-  test_case<int8_t, int8_t, int32_t, 'R', 'R'>(Q, m, n, k);
-  test_case<uint8_t, uint8_t, int32_t, 'R', 'C'>(Q, m, n, k);
-  test_case<uint8_t, int8_t, int32_t, 'C', 'R'>(Q, m, n, k);
+  // test_case<int8_t, int8_t, int32_t, 'R', 'R'>(Q, m, n, k);
+  // test_case<uint8_t, uint8_t, int32_t, 'R', 'C'>(Q, m, n, k);
+  // test_case<uint8_t, int8_t, int32_t, 'C', 'R'>(Q, m, n, k);
 
-  test_case<int8_t, uint4_t, int32_t, 'R', 'C'>(Q, m, n, k);
-  test_case<int4_t, uint8_t, int32_t, 'R', 'C'>(Q, m, n, k);
+  // test_case<int8_t, uint4_t, int32_t, 'R', 'C'>(Q, m, n, k);
+  // test_case<int4_t, uint8_t, int32_t, 'R', 'C'>(Q, m, n, k);
 
-  test_case<uint4_t, uint4_t, uint32_t, 'R', 'C'>(Q, m, n, k);
-  test_case<uint4_t, uint4_t, uint32_t, 'R', 'R'>(Q, m, n, k);
+  // test_case<uint4_t, uint4_t, uint32_t, 'R', 'C'>(Q, m, n, k);
+  // test_case<uint4_t, uint4_t, uint32_t, 'R', 'R'>(Q, m, n, k);
 
-  // Upconversion cases
-  test_case<half_t, float_e5m2_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<half_t, float_e5m2_t, float, 'R', 'C'>(Q, m, n, k);
+  // // Upconversion cases
+  // test_case<half_t, float_e5m2_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<half_t, float_e5m2_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<float_e5m2_t, float_e5m2_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<float_e5m2_t, float_e5m2_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<float_e5m2_t, float_e5m2_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<float_e5m2_t, float_e5m2_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<half_t, float_e4m3_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<half_t, float_e4m3_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<half_t, float_e4m3_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<half_t, float_e4m3_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<float_e4m3_t, float_e4m3_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<float_e4m3_t, float_e4m3_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<float_e4m3_t, float_e4m3_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<float_e4m3_t, float_e4m3_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<half_t, float_e2m1_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<half_t, float_e2m1_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<half_t, float_e2m1_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<half_t, float_e2m1_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<half_t, uint8_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<half_t, uint8_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<half_t, uint8_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<half_t, uint8_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<half_t, int8_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<half_t, int8_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<half_t, int8_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<half_t, int8_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<half_t, uint4_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<half_t, uint4_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<half_t, uint4_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<half_t, uint4_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<half_t, int4_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<half_t, int4_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<half_t, int4_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<half_t, int4_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<bfloat16_t, float_e5m2_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<bfloat16_t, float_e5m2_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<bfloat16_t, float_e5m2_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<bfloat16_t, float_e5m2_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<bfloat16_t, float_e4m3_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<bfloat16_t, float_e4m3_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<bfloat16_t, float_e4m3_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<bfloat16_t, float_e4m3_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<bfloat16_t, float_e2m1_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<bfloat16_t, float_e2m1_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<bfloat16_t, float_e2m1_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<bfloat16_t, float_e2m1_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<bfloat16_t, uint8_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<bfloat16_t, uint8_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<bfloat16_t, uint8_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<bfloat16_t, uint8_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<bfloat16_t, int8_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<bfloat16_t, int8_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<bfloat16_t, int8_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<bfloat16_t, int8_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<bfloat16_t, uint4_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<bfloat16_t, uint4_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<bfloat16_t, uint4_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<bfloat16_t, uint4_t, float, 'R', 'C'>(Q, m, n, k);
 
-  test_case<bfloat16_t, int4_t, float, 'R', 'R'>(Q, m, n, k);
-  test_case<bfloat16_t, int4_t, float, 'R', 'C'>(Q, m, n, k);
+  // test_case<bfloat16_t, int4_t, float, 'R', 'R'>(Q, m, n, k);
+  // test_case<bfloat16_t, int4_t, float, 'R', 'C'>(Q, m, n, k);
 }
