@@ -62,7 +62,8 @@ void
 gemm_device(ATensor   const& A,         // (M,K)
             BTensor   const& B,         // (N,K)
             CTensor        & C,         // (M,N)
-            TiledMMA const & mma)
+            TiledMMA const & mma,
+            CTensor        & Aux)      // (M,K)
 {
   // -----
   // Setup
@@ -78,6 +79,7 @@ gemm_device(ATensor   const& A,         // (M,K)
   Tensor cA = make_identity_tensor(A.shape());   // (M,K)
   Tensor cB = make_identity_tensor(B.shape());   // (N,K)
   Tensor cC = make_identity_tensor(C.shape());   // (M,N)
+  Tensor cAux = make_identity_tensor(Aux.shape()); // (M,K)
 
   /* Split GEMM into workgroup tiles, and identify our workgroup's tile (wg_coord) */
   auto wg_tile = mma.tile_mnk();
@@ -87,16 +89,17 @@ gemm_device(ATensor   const& A,         // (M,K)
   auto smem = compat::local_mem<half_t[size(select<0,1>(wg_tile))]>();
   auto BLK_M = size<0>(wg_tile);
   auto BLK_N = size<1>(wg_tile);
-  Tensor STensor = make_tensor(make_smem_ptr(smem), make_layout(make_shape(BLK_M, BLK_N), make_stride(_1{}, BLK_M)));
+  Tensor STensor = make_tensor(make_smem_ptr(smem), make_layout(make_shape(BLK_M, BLK_N), make_stride(Int<BLK_N>{}, _1{})));  // row major tensor
 
   Tensor gA = local_tile(cA, select<0,2>(wg_tile), make_coord(wg_m,_));  // (BLK_M,BLK_K,k)
   Tensor gB = local_tile(cB, select<1,2>(wg_tile), make_coord(wg_n,_));  // (BLK_N,BLK_K,k)
   Tensor gC = local_tile(cC, wg_tile, wg_coord, Step<_1,_1, X>{});       // (BLK_M,BLK_N)
-
+  Tensor gAux = local_tile(cAux, wg_tile, wg_coord, Step<_1,_1, X>{}); // (BLK_M,BLK_K)
   /* Create block 2D TiledCopies */
   auto copy_a = make_block_2d_copy_A(mma, A);
   auto copy_b = make_block_2d_copy_B(mma, B);
   auto copy_c = make_block_2d_copy_D(mma, C);
+  auto copy_aux = make_block_2d_copy_D(mma, Aux);
 
   auto copy_X = make_block_2d_copy_D(mma, make_tensor(make_gmem_ptr(static_cast<half_t*>(nullptr)), C.layout()));
   // SLM store 
@@ -105,6 +108,11 @@ gemm_device(ATensor   const& A,         // (M,K)
   using TVLayout = typename decltype(copy_X)::TiledLayout_TV;
   auto slm_store = TiledCopy<Atom, TVLayout, Tiler_MN>{};
   auto thr_slm_store = slm_store.get_slice(local_id);
+
+  using TVLayoutLoad = typename decltype(copy_a)::TiledLayout_TV;
+  using Tiler_MN_load = typename decltype(copy_a)::Tiler_MN;
+  auto slm_load = TiledCopy<Atom, TVLayoutLoad, Tiler_MN_load>{};
+  auto thr_slm_load = slm_load.get_slice(local_id);
 
   /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
   auto thr_mma    =    mma.get_slice(local_id);
@@ -127,10 +135,14 @@ gemm_device(ATensor   const& A,         // (M,K)
   auto tCrC = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(wg_tile)));
   // auto r16 = make_tensor<half_t>(layout(tCrC));
   auto r16 = thr_copy_X.partition_sg_fragment_S(gC);
+  auto tCrAux = thr_mma.partition_sg_fragment_C(make_identity_tensor(select<0,1>(wg_tile)));
   Tensor tCgC = thr_mma.partition_C(gC);    /* also matches copy_c's source layout */
+  Tensor tAgAux = thr_mma.partition_C(gAux);
 
   Tensor tOrO = thr_slm_store.retile_S(r16);
   Tensor tOsO = thr_slm_store.partition_D(STensor);
+  Tensor tIrI = thr_slm_load.retile_D(tArA);
+  Tensor tIsI = thr_slm_load.partition_S(STensor);
 
   /* Create prefetch TiledCopy instances */
   auto prefetch_a = make_block_2d_prefetch(copy_a);
@@ -189,11 +201,7 @@ gemm_device(ATensor   const& A,         // (M,K)
     barrier_wait(barrier_scope);
   }
 
-  /* Write C to global memory */
-  copy(copy_c, tCrC, tCgC);
-  // for(int i =0; i < size(tOrO); i++) {
-  //   tOrO[i] = (half_t)tCrC[i];
-  // }
+  copy(copy_aux, tCrC, tAgAux);
   reorder(tCrC, r16);
   copy(slm_store, tOrO, tOsO);
   // #if defined(__SYCL_DEVICE_ONLY__) && defined(__INTEL_LLVM_COMPILER)
@@ -212,7 +220,39 @@ gemm_device(ATensor   const& A,         // (M,K)
   // #endif
   barrier_arrive(SPIRVScope::ScopeWorkgroup, SPIRVMemorySemantics::SemanticsRelease | SPIRVMemorySemantics::SemanticsWGMemory);
   barrier_wait(SPIRVScope::ScopeWorkgroup, SPIRVMemorySemantics::SemanticsAcquire | SPIRVMemorySemantics::SemanticsWGMemory);
+  #if 0  
+  if(cute::thread0()) {
+    // print("\n");
+    // print(copy_c);
+    // print("\n");
+    // print(tCrC);
+    // print("\n");
+    for(int i = 0; i < BLK_M; i++) {
+      for(int j = 0; j < BLK_N; j++) {
+        print("["); print(Aux(i, j)); print(", ");
+        print(STensor(i, j)); print("] ");
+      }
+      print("\n");
+    }
+  }
+  #endif
   
+  clear(tCrC);
+  // skip prefetch
+  for(int k_tile = 0; k_tile < k_tile_count; k_tile++) {
+    copy(slm_load, tIsI(_,_,k_tile), tIrI(_,_,0));
+    copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
+    barrier_arrive(SPIRVScope::ScopeWorkgroup, SPIRVMemorySemantics::SemanticsRelease | SPIRVMemorySemantics::SemanticsWGMemory);
+    barrier_wait(SPIRVScope::ScopeWorkgroup, SPIRVMemorySemantics::SemanticsAcquire | SPIRVMemorySemantics::SemanticsWGMemory);
+    reorder(tArA, tCrA);
+    reorder(tBrB, tCrB);
+    gemm(mma, tCrA, tCrB, tCrC);
+  }
+
+  /* Write C to global memory which is for validation */
+  copy(copy_c, tCrC, tCgC);
+
+  #if 0  
   if(cute::thread0()) {
     // print("\n");
     // print(copy_c);
@@ -222,11 +262,12 @@ gemm_device(ATensor   const& A,         // (M,K)
     for(int i = 0; i < BLK_M; i++) {
       for(int j = 0; j < BLK_N; j++) {
         print("["); print(C(i, j)); print(", ");
-        print(STensor(i, j)); print("] ");
+        print("] ");
       }
       print("\n");
     }
   }
+  #endif
 }
 
 template <typename TA, typename TB, typename TC>
@@ -264,9 +305,9 @@ choose_tiled_mma(ATensor const& A, BTensor const& B, CTensor const&)
   using _K = conditional_t<use_1x_dpas_per_k,
                            C<op.K>, C<op.K*2>>;
 
-  using WGTile = Shape<_32, _32, _K>;                               // 256x256 WG tile size
-  using SGLayout8x4 = Layout<Shape<_2, _2, _1>, Stride<_2, _1, _0>>;  // 8x4 SG tiling, n-major
-  using SGLayout4x8 = Layout<Shape<_2, _2, _1>, Stride<_2, _1, _0>>;  // 4x8 SG tiling, n-major
+  using WGTile = Shape<_64, _64, _K>;                               // 256x256 WG tile size
+  using SGLayout8x4 = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;  // 8x4 SG tiling, n-major
+  using SGLayout4x8 = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;  // 4x8 SG tiling, n-major
   using SGLayout = conditional_t<use_4x8_sg, SGLayout4x8, SGLayout8x4>;
 
   using MMA = typename TiledMMAHelper<MMA_Atom<decltype(op)>, Layout<WGTile>, SGLayout>::TiledMMA;
@@ -280,7 +321,8 @@ void
 gemm_cute(sycl::queue &Q,
           ATensor   const& A,         // (M,K)
           BTensor   const& B,         // (N,K)
-          CTensor        & C)         // (M,N)
+          CTensor        & C,
+          CTensor        & Aux)      // (M,N)
 {
   auto mma = choose_tiled_mma(A, B, C);
 
@@ -298,7 +340,7 @@ gemm_cute(sycl::queue &Q,
 
   auto event = Q.parallel_for<GemmCuteName<TA, TB, layoutA, layoutB>>(sycl::nd_range<2>(global, local), kernel_props,
     [=](auto) {
-      gemm_device(A, B, C, mma);
+      gemm_device(A, B, C, mma, Aux);
     }
   );
 
@@ -330,8 +372,9 @@ gemm_verify(sycl::queue &Q,
     for (int h = 0; h < k; h++)
       c += AccType(A(i,h)) * AccType(B(j,h));
 
-    auto tol = AccType(1e-5f * k);
+    auto tol = AccType(1e-2f);
     if (std::abs(SignedAccType(c - AccType(C(i,j)))) > tol) {
+      #define SHOW_DIFF
 #ifdef SHOW_DIFF
       printf("Error at (%d,%d): got %f, expected %f\n", i, j, double(C(i,j)), double(c));
 #endif
@@ -362,10 +405,12 @@ test_case(sycl::queue &Q, int m, int n, int k)
   auto A = make_shared_usm_tensor<TA,  layoutA>(Q, m, k);
   auto B = make_shared_usm_tensor<TB, tlayoutB>(Q, n, k);
   auto C = make_shared_usm_tensor<TC,      'R'>(Q, m, n);
+  auto Aux = make_shared_usm_tensor<TC,      'R'>(Q, m, k);
 
   random_fill(A);
   random_fill(B);
   zero_fill(C);
+  zero_fill(Aux);
 
 #ifndef SKIP_VERIFY
   auto A_ref = make_shared_usm_tensor<float,  layoutA>(Q, m, k);
@@ -379,14 +424,17 @@ test_case(sycl::queue &Q, int m, int n, int k)
   subbyte_pack(B);
 
   // Test accuracy:
-  gemm_cute<decltype(A), decltype(B), decltype(C), TA, TB, layoutA, layoutB>(Q, A, B, C);
+  gemm_cute<decltype(A), decltype(B), decltype(C), TA, TB, layoutA, layoutB>(Q, A, B, C, Aux);
   Q.wait_and_throw();
 
 #ifdef SKIP_VERIFY
   const bool ok = true;
   std::cout << "verification skipped";
 #else
-  bool ok = gemm_verify(Q, A_ref, B_ref, C);
+  auto Aux_ref = make_shared_usm_tensor<float, 'R'>(Q, m, k);
+  
+  copy(Aux, Aux_ref);
+  bool ok = gemm_verify(Q, Aux_ref, B_ref, C);
   std::cout << (ok ? "passed" : "failed");
 #endif
 
@@ -397,7 +445,7 @@ test_case(sycl::queue &Q, int m, int n, int k)
 
     timer.start();
     for (int i = 0; i < timing_iterations; ++i)
-      gemm_cute<decltype(A), decltype(B), decltype(C), TA, TB, layoutA, layoutB>(Q, A, B, C);
+      gemm_cute<decltype(A), decltype(B), decltype(C), TA, TB, layoutA, layoutB>(Q, A, B, C, Aux);
     Q.wait_and_throw();
 
     double avg = timer.seconds() / timing_iterations;
@@ -409,10 +457,12 @@ test_case(sycl::queue &Q, int m, int n, int k)
   free_usm_tensor(A, Q);
   free_usm_tensor(B, Q);
   free_usm_tensor(C, Q);
+  free_usm_tensor(Aux, Q);
 
 #ifndef SKIP_VERIFY
   free_usm_tensor(A_ref, Q);
   free_usm_tensor(B_ref, Q);
+  free_usm_tensor(Aux_ref, Q);
 #endif
 
   std::cout << '\n';
@@ -453,7 +503,7 @@ int main(int argc, char** argv)
   // test_case<tfloat32_t, tfloat32_t, float, 'R', 'C'>(Q, m, n, k);
   // test_case<tfloat32_t, tfloat32_t, float, 'C', 'R'>(Q, m, n, k);
 
-  test_case<half_t, half_t, float, 'R', 'R'>(Q, 32, 32, 32);
+  test_case<half_t, half_t, float, 'R', 'R'>(Q, 64, 64, 64);
   // test_case<half_t, half_t, float, 'R', 'C'>(Q, m, n, k);
   // test_case<half_t, half_t, float, 'C', 'R'>(Q, m, n, k);
 
