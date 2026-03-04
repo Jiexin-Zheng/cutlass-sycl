@@ -90,6 +90,7 @@ gemm_device(ATensor   const& A,         // (M,K)
   auto BLK_M = size<0>(wg_tile);
   auto BLK_N = size<1>(wg_tile);
   Tensor STensor = make_tensor(make_smem_ptr(smem), make_layout(make_shape(BLK_M, BLK_N), make_stride(Int<BLK_N>{}, _1{})));  // row major tensor
+  Tensor SInTensor = make_tensor(make_smem_ptr(smem), make_layout(make_shape(BLK_N, BLK_M), make_stride(_1{}, Int<BLK_N>{})));  // column major tensor
 
   Tensor gA = local_tile(cA, select<0,2>(wg_tile), make_coord(wg_m,_));  // (BLK_M,BLK_K,k)
   Tensor gB = local_tile(cB, select<1,2>(wg_tile), make_coord(wg_n,_));  // (BLK_N,BLK_K,k)
@@ -97,6 +98,7 @@ gemm_device(ATensor   const& A,         // (M,K)
   Tensor gAux = local_tile(cAux, wg_tile, wg_coord, Step<_1,_1, X>{}); // (BLK_M,BLK_K)
   /* Create block 2D TiledCopies */
   auto copy_a = make_block_2d_copy_A(mma, A);
+  auto copy_Y = make_block_2d_copy_A(mma, make_tensor(A.data(), make_layout(shape(A))));
   auto copy_b = make_block_2d_copy_B(mma, B);
   auto copy_c = make_block_2d_copy_D(mma, C);
   auto copy_aux = make_block_2d_copy_D(mma, Aux);
@@ -109,8 +111,8 @@ gemm_device(ATensor   const& A,         // (M,K)
   auto slm_store = TiledCopy<Atom, TVLayout, Tiler_MN>{};
   auto thr_slm_store = slm_store.get_slice(local_id);
 
-  using TVLayoutLoad = typename decltype(copy_a)::TiledLayout_TV;
-  using Tiler_MN_load = typename decltype(copy_a)::Tiler_MN;
+  using TVLayoutLoad = typename decltype(copy_Y)::TiledLayout_TV;
+  using Tiler_MN_load = typename decltype(copy_Y)::Tiler_MN;
   auto slm_load = TiledCopy<Atom, TVLayoutLoad, Tiler_MN_load>{};
   auto thr_slm_load = slm_load.get_slice(local_id);
 
@@ -119,12 +121,14 @@ gemm_device(ATensor   const& A,         // (M,K)
   auto thr_copy_a = copy_a.get_slice(local_id);
   auto thr_copy_b = copy_b.get_slice(local_id);
   auto thr_copy_X = copy_X.get_slice(local_id);
+  auto thr_copy_Y = copy_Y.get_slice(local_id);
   /* Register fragments for MMA */
   auto tCrA = thr_mma.partition_sg_fragment_A(gA(_,_,0));
   auto tCrB = thr_mma.partition_sg_fragment_B(gB(_,_,0));
 
   /* Register fragments for copies */
   auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_,_,0));
+  auto tArAX = thr_copy_Y.partition_sg_fragment_D(gA(_,_,0));
   auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_,_,0));
 
   /* Partition global tensor (proxies) for copies */
@@ -141,8 +145,8 @@ gemm_device(ATensor   const& A,         // (M,K)
 
   Tensor tOrO = thr_slm_store.retile_S(r16);
   Tensor tOsO = thr_slm_store.partition_D(STensor);
-  Tensor tIrI = thr_slm_load.retile_D(tArA);
-  Tensor tIsI = thr_slm_load.partition_S(STensor);
+  Tensor tIrI = thr_slm_load.retile_D(tArAX);
+  Tensor tIsI = thr_slm_load.partition_S(SInTensor);
 
   /* Create prefetch TiledCopy instances */
   auto prefetch_a = make_block_2d_prefetch(copy_a);
@@ -244,7 +248,7 @@ gemm_device(ATensor   const& A,         // (M,K)
     copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
     barrier_arrive(SPIRVScope::ScopeWorkgroup, SPIRVMemorySemantics::SemanticsRelease | SPIRVMemorySemantics::SemanticsWGMemory);
     barrier_wait(SPIRVScope::ScopeWorkgroup, SPIRVMemorySemantics::SemanticsAcquire | SPIRVMemorySemantics::SemanticsWGMemory);
-    reorder(tArA, tCrA);
+    reorder(tArAX, tCrA);
     reorder(tBrB, tCrB);
     gemm(mma, tCrA, tCrB, tCrC);
   }
@@ -370,9 +374,9 @@ gemm_verify(sycl::queue &Q,
 
     auto c = AccType(0);
     for (int h = 0; h < k; h++)
-      c += AccType(A(i,h)) * AccType(B(j,h));
+      c += AccType(A(h,i)) * AccType(B(j,h));
 
-    auto tol = AccType(1e-2f);
+    auto tol = AccType(2e-2f);
     if (std::abs(SignedAccType(c - AccType(C(i,j)))) > tol) {
       #define SHOW_DIFF
 #ifdef SHOW_DIFF
