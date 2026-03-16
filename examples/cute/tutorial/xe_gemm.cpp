@@ -55,7 +55,6 @@
 
 using namespace cute;
 
-
 template <class ATensor, class BTensor, class CTensor,
           class TiledMMA>
 void
@@ -86,7 +85,8 @@ gemm_device(ATensor   const& A,         // (M,K)
   auto wg_coord = make_coord(wg_m, wg_n, 0);
 
   /*allocate shared local memory*/
-  auto smem = compat::local_mem<half_t[size(select<0,1>(wg_tile))]>();
+  using SlmT = typename ATensor::element_type;
+  auto smem = compat::local_mem<SlmT[size(select<0,1>(wg_tile))]>();
   auto BLK_M = size<0>(wg_tile);
   auto BLK_N = size<1>(wg_tile);
   Tensor STensor = make_tensor(make_smem_ptr(smem), make_layout(make_shape(BLK_M, BLK_N), make_stride(Int<BLK_N>{}, _1{})));  // row major tensor
@@ -103,17 +103,18 @@ gemm_device(ATensor   const& A,         // (M,K)
   auto copy_c = make_block_2d_copy_D(mma, C);
   auto copy_aux = make_block_2d_copy_D(mma, Aux);
 
-  auto copy_X = make_block_2d_copy_D(mma, make_tensor(make_gmem_ptr(static_cast<half_t*>(nullptr)), C.layout()));
+  auto copy_X = make_block_2d_copy_D(mma, make_tensor(make_gmem_ptr(static_cast<SlmT*>(nullptr)), C.layout()));
   // SLM store 
-  using Atom = Copy_Atom<UniversalCopy<half_t>, half_t>;
+  using StoreAtom = Copy_Atom<XE_1D_STSM<SlmT>, SlmT>;
   using Tiler_MN = typename decltype(copy_X)::Tiler_MN;
   using TVLayout = typename decltype(copy_X)::TiledLayout_TV;
-  auto slm_store = TiledCopy<Atom, TVLayout, Tiler_MN>{};
+  auto slm_store = TiledCopy<StoreAtom, TVLayout, Tiler_MN>{};
   auto thr_slm_store = slm_store.get_slice(local_id);
 
+  using LoadAtom = Copy_Atom<XE_1D_LDSM<SlmT>, SlmT>;
   using TVLayoutLoad = typename decltype(copy_Y)::TiledLayout_TV;
   using Tiler_MN_load = typename decltype(copy_Y)::Tiler_MN;
-  auto slm_load = TiledCopy<Atom, TVLayoutLoad, Tiler_MN_load>{};
+  auto slm_load = TiledCopy<LoadAtom, TVLayoutLoad, Tiler_MN_load>{};
   auto thr_slm_load = slm_load.get_slice(local_id);
 
   /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
@@ -437,7 +438,10 @@ test_case(sycl::queue &Q, int m, int n, int k)
 #else
   auto Aux_ref = make_shared_usm_tensor<float, 'R'>(Q, m, k);
   
-  copy(Aux, Aux_ref);
+  // The SLM path truncates accumulators (TC) to TA before the second GEMM,
+  // so the reference must apply the same truncation for correct comparison.
+  for (int i = 0; i < size(Aux); i++)
+    Aux_ref(i) = float(TA(Aux(i)));
   bool ok = gemm_verify(Q, Aux_ref, B_ref, C);
   std::cout << (ok ? "passed" : "failed");
 #endif
@@ -508,6 +512,7 @@ int main(int argc, char** argv)
   // test_case<tfloat32_t, tfloat32_t, float, 'C', 'R'>(Q, m, n, k);
 
   test_case<half_t, half_t, float, 'R', 'R'>(Q, 64, 64, 64);
+  test_case<int8_t, int8_t, int32_t, 'R', 'R'>(Q, 64, 64, 64);
   // test_case<half_t, half_t, float, 'R', 'C'>(Q, m, n, k);
   // test_case<half_t, half_t, float, 'C', 'R'>(Q, m, n, k);
 
