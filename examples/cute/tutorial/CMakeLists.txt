@@ -68,6 +68,11 @@ if (CUTLASS_ENABLE_SYCL)
     )
 
     cutlass_example_add_executable(
+      cute_tutorial_xe_gemm_slm_copy_1d
+      xe_gemm_slm_copy_1d.cpp
+    )    
+
+    cutlass_example_add_executable(
       cute_tutorial_slm_copy
       slm_copy.cpp
     )

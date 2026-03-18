@@ -55,8 +55,9 @@ template<class S, class D>
 struct Copy_Traits<XE_1D_LDSM<S, D>> {
     // Logical thread id to thread idx
     using ThrID = Layout<_16>;
-    // Map from (src-thr,src-val) to bit
-    using SrcLayout = Layout<Shape<_16, Int<sizeof_bits<S>::value>>, Stride<_0, _1>>;
+    // Map from (src-thr,src-val) to bit — per-thread SLM scatter addressing
+    using SrcLayout = Layout<Shape<_16, Int<sizeof_bits<S>::value>>,
+                             Stride<Int<sizeof_bits<S>::value>, _1>>;
     // Map from (dst-thr,dst-val) to bit
     using DstLayout = Layout<Shape<_16, Shape<Int<sizeof_bits<D>::value / sizeof_bits<S>::value>, Int<sizeof_bits<S>::value>>>,
                              Stride<Int<sizeof_bits<S>::value>, Stride<Int<sizeof_bits<S>::value * 16>, _1>>>;
@@ -82,10 +83,11 @@ struct Copy_Traits<XE_1D_STSM<S, D>> {
     // Logical thread id to thread idx
     using ThrID = Layout<_16>;
     // Map from (src-thr,src-val) to bit
-    using SrcLayout = Layout<Shape<_16, Shape<Int<sizeof_bits<S>::value / sizeof_bits<D>::value>, Int<sizeof_bits<D>::value>>>,
+    using SrcLayout = Layout<Shape <_16, Shape<Int<sizeof_bits<S>::value / sizeof_bits<D>::value>, Int<sizeof_bits<D>::value>>>,
                              Stride<Int<sizeof_bits<D>::value>, Stride<Int<sizeof_bits<D>::value * 16>, _1>>>;
-    // Map from (dst-thr,dst-val) to bit
-    using DstLayout = Layout<Shape<_16, Int<sizeof_bits<D>::value>>, Stride<_0, _1>>;
+    // Map from (dst-thr,dst-val) to bit — per-thread SLM scatter addressing
+    using DstLayout = Layout<Shape<_16, Int<sizeof_bits<D>::value>>,
+                             Stride<Int<sizeof_bits<D>::value>, _1>>;
     // Reference map from (thr,val) to bit
     using RefLayout = SrcLayout;
 };

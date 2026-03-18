@@ -46,7 +46,7 @@ using namespace compat::experimental;
 
 template<class...> class CopyKernelVectorizedName;
 
-template <class TensorS, class TensorD>
+template <class TensorS, class TensorD, class AccessType>
 void copy_kernel_vectorized(TensorS tile_S, TensorD tile_D) {
   using namespace cute;
 
@@ -56,24 +56,19 @@ void copy_kernel_vectorized(TensorS tile_S, TensorD tile_D) {
   auto smem = compat::local_mem<Element[size(tile_S)]>();
   Tensor sTensor = make_tensor(make_smem_ptr(smem), tile_S.layout());
 
-  // Define `AccessType` which controls the size of the actual memory access.
-  // using AccessType = cutlass::AlignedArray<Element, size(VecLayout{})>;
-
   // A copy atom corresponds to one hardware memory access.
   using traits_load = Copy_Traits<XE_1D_LOAD_GLOBAL<
-      typename uint_bit<sizeof_bits_v<Element>>::type, cutlass::uint128_t>>;
+      typename uint_bit<sizeof_bits_v<Element>>::type, AccessType>>;
   using Atom_load = Copy_Atom<traits_load, Element>;
   using traits_store = Copy_Traits<XE_1D_STORE_GLOBAL<
-      cutlass::uint128_t, typename uint_bit<sizeof_bits_v<Element>>::type>>;
+      AccessType, typename uint_bit<sizeof_bits_v<Element>>::type>>;
   using Atom_store = Copy_Atom<traits_store, Element>;
 
   using traits_ldsm =
-      Copy_Traits<XE_1D_LDSM<typename uint_bit<sizeof_bits_v<Element>>::type,
-                             cutlass::uint128_t>>;
+      Copy_Traits<XE_1D_LDSM<AccessType, AccessType>>;
   using Atom_ldsm = Copy_Atom<traits_ldsm, Element>;
   using traits_stsm =
-      Copy_Traits<XE_1D_STSM<cutlass::uint128_t,
-                             typename uint_bit<sizeof_bits_v<Element>>::type>>;
+      Copy_Traits<XE_1D_STSM<AccessType, AccessType>>;
   using Atom_stsm = Copy_Atom<traits_stsm, Element>;
 
   // Construct tiled copy, a tiling of copy atoms.
@@ -84,8 +79,8 @@ void copy_kernel_vectorized(TensorS tile_S, TensorD tile_D) {
   // incompatible layouts will result in compile time errors.
 
   auto VecLayout = make_layout(
-      make_shape(_1{}, Int<sizeof(cutlass::uint128_t) / sizeof(Element)>{}),
-      Stride<Int<sizeof(cutlass::uint128_t) / sizeof(Element)>, _1>{});
+      make_shape(_1{}, Int<sizeof(AccessType) / sizeof(Element)>{}),
+      Stride<Int<sizeof(AccessType) / sizeof(Element)>, _1>{});
   auto ThreadLayout = make_layout(make_shape(_1{}, _16{}));
   auto tiled_copy_load = make_tiled_copy(Atom_load{},  // access size
                                          ThreadLayout, // thread layout
@@ -125,29 +120,6 @@ void copy_kernel_vectorized(TensorS tile_S, TensorD tile_D) {
   Tensor fragment = make_fragment_like(
       thr_copy_load.partition_D(tile_S)); // (CopyOp, CopyM, CopyN)
 
-#if 0
-  if (thread(0, 0)) {
-    print("loading to registers from src ========================\n");
-    print("tile_S:");
-    print(tile_S.layout());
-    print("\n");
-
-    print("thr_tile_load_S: ");
-    print(thr_tile_load_S.layout());
-    print("\n");
-    print(thr_tile_load_S.data());
-    print("\n");
-
-    print("thr_tile_store_D: ");
-    print(thr_tile_store_D.layout());
-    print("\n");
-
-    print("fragment: ");
-    print(fragment.layout());
-    print("\n");
-  }
-#endif
-
   // Copy from GMEM to RMEM and from RMEM to GMEM
   prefetch(tiled_copy_load, thr_tile_load_S);
   copy(tiled_copy_load, thr_tile_load_S, fragment);
@@ -185,7 +157,8 @@ TEST(PVC_1d_copy, copy_double) {
     static constexpr auto subgroup_size = 16;
     auto blockDim = compat::dim3(subgroup_size);
 
-    launch<copy_kernel_vectorized<decltype(S), decltype(D)>, CopyKernelVectorizedName<decltype(S), decltype(D)>>(
+    launch<copy_kernel_vectorized<decltype(S), decltype(D), cutlass::uint128_t>,
+           CopyKernelVectorizedName<decltype(S), decltype(D), cutlass::uint128_t>>(
         launch_policy{
             compat::dim3(1), blockDim,
             kernel_properties{sycl_exp::sub_group_size<SUBGROUP_SIZE>}},
@@ -228,7 +201,8 @@ TEST(PVC_1d_copy, copy_double) {
     //
     // Launch the kernel
     //
-    launch<copy_kernel_vectorized<decltype(S), decltype(D)>, CopyKernelVectorizedName<decltype(S), decltype(D)>>(
+    launch<copy_kernel_vectorized<decltype(S), decltype(D), cutlass::uint128_t>,
+           CopyKernelVectorizedName<decltype(S), decltype(D), cutlass::uint128_t>>(
         launch_policy{
             compat::dim3(1), blockDim,
             kernel_properties{sycl_exp::sub_group_size<SUBGROUP_SIZE>}},
@@ -270,7 +244,8 @@ TEST(PVC_1d_copy, copy_double) {
     //
     // Launch the kernel
     //
-    launch<copy_kernel_vectorized<decltype(S), decltype(D)>, CopyKernelVectorizedName<decltype(S), decltype(D)>>(
+    launch<copy_kernel_vectorized<decltype(S), decltype(D), cutlass::uint128_t>,
+           CopyKernelVectorizedName<decltype(S), decltype(D), cutlass::uint128_t>>(
         launch_policy{
             compat::dim3(1), blockDim,
             kernel_properties{sycl_exp::sub_group_size<SUBGROUP_SIZE>}},
@@ -281,5 +256,128 @@ TEST(PVC_1d_copy, copy_double) {
     for (int i = 0; i < M * N; ++i) {
       EXPECT_EQ(host_output[i], host_src[i]);
     }
+  }
+}
+
+// Test d16u32 path: XE_1D_LDSM/STSM with uint16_t access
+TEST(PVC_1d_copy, copy_slm_d16u32) {
+  constexpr int M = 1;
+  constexpr int N = 128;
+  using Element = uint16_t;
+  using SlmAccess = uint16_t;
+
+  cutlass::host_vector<Element> host_src(M * N);
+  cutlass::host_vector<Element> host_output(M * N);
+
+  for (size_t i = 0; i < host_src.size(); ++i) {
+    host_src[i] = static_cast<Element>(i);
+  }
+
+  cutlass::device_vector<Element> device_src = host_src;
+  cutlass::device_vector<Element> device_output(M * N);
+
+  Tensor S =
+      make_tensor(make_gmem_ptr(device_src.data()),
+                  make_layout(Shape<Int<M>, Int<N>>{}, Stride<Int<N>, _1>{}));
+  Tensor D =
+      make_tensor(make_gmem_ptr(device_output.data()),
+                  make_layout(Shape<Int<M>, Int<N>>{}, Stride<Int<N>, _1>{}));
+
+  static constexpr auto subgroup_size = 16;
+  auto blockDim = compat::dim3(subgroup_size);
+
+  launch<copy_kernel_vectorized<decltype(S), decltype(D), SlmAccess>,
+         CopyKernelVectorizedName<decltype(S), decltype(D), SlmAccess>>(
+      launch_policy{
+          compat::dim3(1), blockDim,
+          kernel_properties{sycl_exp::sub_group_size<SUBGROUP_SIZE>}},
+      S, D);
+
+  compat::wait_and_throw();
+  host_output = device_output;
+  for (int i = 0; i < M * N; ++i) {
+    EXPECT_EQ(host_output[i], host_src[i]);
+  }
+}
+
+// Test d8u32 path: XE_1D_LDSM/STSM with uint8_t access
+TEST(PVC_1d_copy, copy_slm_d8u32) {
+  constexpr int M = 1;
+  constexpr int N = 128;
+  using Element = uint8_t;
+  using SlmAccess = uint8_t;
+
+  cutlass::host_vector<Element> host_src(M * N);
+  cutlass::host_vector<Element> host_output(M * N);
+
+  for (size_t i = 0; i < host_src.size(); ++i) {
+    host_src[i] = static_cast<Element>(i);
+  }
+
+  cutlass::device_vector<Element> device_src = host_src;
+  cutlass::device_vector<Element> device_output(M * N);
+
+  Tensor S =
+      make_tensor(make_gmem_ptr(device_src.data()),
+                  make_layout(Shape<Int<M>, Int<N>>{}, Stride<Int<N>, _1>{}));
+  Tensor D =
+      make_tensor(make_gmem_ptr(device_output.data()),
+                  make_layout(Shape<Int<M>, Int<N>>{}, Stride<Int<N>, _1>{}));
+
+  static constexpr auto subgroup_size = 16;
+  auto blockDim = compat::dim3(subgroup_size);
+
+  launch<copy_kernel_vectorized<decltype(S), decltype(D), SlmAccess>,
+         CopyKernelVectorizedName<decltype(S), decltype(D), SlmAccess>>(
+      launch_policy{
+          compat::dim3(1), blockDim,
+          kernel_properties{sycl_exp::sub_group_size<SUBGROUP_SIZE>}},
+      S, D);
+
+  compat::wait_and_throw();
+  host_output = device_output;
+  for (int i = 0; i < M * N; ++i) {
+    EXPECT_EQ(host_output[i], host_src[i]);
+  }
+}
+
+// Test d32 (single) path: XE_1D_LDSM/STSM with uint32_t access
+TEST(PVC_1d_copy, copy_slm_d32) {
+  constexpr int M = 1;
+  constexpr int N = 128;
+  using Element = float;
+  using SlmAccess = uint32_t;
+
+  cutlass::host_vector<Element> host_src(M * N);
+  cutlass::host_vector<Element> host_output(M * N);
+
+  for (size_t i = 0; i < host_src.size(); ++i) {
+    host_src[i] = static_cast<Element>(i);
+  }
+
+  cutlass::device_vector<Element> device_src = host_src;
+  cutlass::device_vector<Element> device_output(M * N);
+
+  Tensor S =
+      make_tensor(make_gmem_ptr(device_src.data()),
+                  make_layout(Shape<Int<M>, Int<N>>{}, Stride<Int<N>, _1>{}));
+  Tensor D =
+      make_tensor(make_gmem_ptr(device_output.data()),
+                  make_layout(Shape<Int<M>, Int<N>>{}, Stride<Int<N>, _1>{}));
+
+  static constexpr auto subgroup_size = 16;
+  auto blockDim = compat::dim3(subgroup_size);
+
+  launch<copy_kernel_vectorized<decltype(S), decltype(D), SlmAccess>,
+         CopyKernelVectorizedName<decltype(S), decltype(D), SlmAccess>>(
+      launch_policy{
+          compat::dim3(1), blockDim,
+          kernel_properties{sycl_exp::sub_group_size<SUBGROUP_SIZE>}},
+      S, D);
+
+  compat::wait_and_throw();
+  host_output = device_output;
+  for (int i = 0; i < M * N; ++i) {
+    EXPECT_EQ(host_output[i], host_src[i]);
   }
 }
