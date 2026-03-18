@@ -243,8 +243,9 @@ gemm_device(ATensor   const& A,         // (M,K)
   #endif
   
   clear(tCrC);
-  // skip prefetch
-  for(int k_tile = 0; k_tile < k_tile_count; k_tile++) {
+  // Second GEMM: K dimension is BLK_M (columns of transposed SLM tile), not original K
+  int k_tile_count_slm = ceil_div(int(BLK_M), int(get<2>(wg_tile)));
+  for(int k_tile = 0; k_tile < k_tile_count_slm; k_tile++) {
     copy(slm_load, tIsI(_,_,k_tile), tIrI(_,_,0));
     copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
     barrier_arrive(SPIRVScope::ScopeWorkgroup, SPIRVMemorySemantics::SemanticsRelease | SPIRVMemorySemantics::SemanticsWGMemory);
@@ -310,9 +311,9 @@ choose_tiled_mma(ATensor const& A, BTensor const& B, CTensor const&)
   using _K = conditional_t<use_1x_dpas_per_k,
                            C<op.K>, C<op.K*2>>;
 
-  using WGTile = Shape<_64, _64, _K>;                               // 256x256 WG tile size
-  using SGLayout8x4 = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;  // 8x4 SG tiling, n-major
-  using SGLayout4x8 = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;  // 4x8 SG tiling, n-major
+  using WGTile = Shape<_256, _256, _K>;                               // 256x256 WG tile size
+  using SGLayout8x4 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;  // 8x4 SG tiling, n-major
+  using SGLayout4x8 = Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>;  // 4x8 SG tiling, n-major
   using SGLayout = conditional_t<use_4x8_sg, SGLayout4x8, SGLayout8x4>;
 
   using MMA = typename TiledMMAHelper<MMA_Atom<decltype(op)>, Layout<WGTile>, SGLayout>::TiledMMA;
@@ -410,7 +411,7 @@ test_case(sycl::queue &Q, int m, int n, int k)
   auto A = make_shared_usm_tensor<TA,  layoutA>(Q, m, k);
   auto B = make_shared_usm_tensor<TB, tlayoutB>(Q, n, k);
   auto C = make_shared_usm_tensor<TC,      'R'>(Q, m, n);
-  auto Aux = make_shared_usm_tensor<TC,      'R'>(Q, m, k);
+  auto Aux = make_shared_usm_tensor<TC,      'R'>(Q, m, n);
 
   random_fill(A);
   random_fill(B);
@@ -436,13 +437,49 @@ test_case(sycl::queue &Q, int m, int n, int k)
   const bool ok = true;
   std::cout << "verification skipped";
 #else
-  auto Aux_ref = make_shared_usm_tensor<float, 'R'>(Q, m, k);
+  auto Aux_ref = make_shared_usm_tensor<float, 'R'>(Q, m, n);
   
   // The SLM path truncates accumulators (TC) to TA before the second GEMM,
   // so the reference must apply the same truncation for correct comparison.
   for (int i = 0; i < size(Aux); i++)
     Aux_ref(i) = float(TA(Aux(i)));
-  bool ok = gemm_verify(Q, Aux_ref, B_ref, C);
+
+  // Per-tile verification: each workgroup independently computes
+  //   C_tile = transpose(SlmT(Acc_tile)) @ B[:, :BLK]^T
+  // where Acc_tile is the first GEMM result stored in Aux.
+  // The transpose through SLM means local_r (= I % BLK) becomes the
+  // column index into the Aux tile, and h2 sweeps over its rows.
+  constexpr int BLK = 256;  // must match WGTile M/N dimension
+  int inner_k = std::min(BLK, k);
+
+  auto ok_ptr = sycl::malloc_shared<bool>(1, Q);
+  *ok_ptr = true;
+
+  Q.parallel_for(sycl::range<2>(m, n), [=](sycl::item<2> id) {
+    int I = id[0], J = id[1];
+    int wg_m = I / BLK;
+    int local_r = I % BLK;
+    int wg_n = J / BLK;
+
+    using AccType = TC;
+    using SignedAccType = ensure_signed_t<AccType>;
+
+    auto c = AccType(0);
+    for (int h2 = 0; h2 < inner_k; h2++) {
+      c += AccType(Aux_ref(wg_m * BLK + h2, wg_n * BLK + local_r)) * AccType(B_ref(J, h2));
+    }
+
+    auto tol = AccType(2e-2f);
+    if (std::abs(SignedAccType(c - AccType(C(I, J)))) > tol) {
+#ifdef SHOW_DIFF
+      printf("Error at (%d,%d): got %f, expected %f\n", I, J, double(C(I,J)), double(c));
+#endif
+      *ok_ptr = false;
+    }
+  }).wait();
+
+  bool ok = *ok_ptr;
+  sycl::free(ok_ptr, Q);
   std::cout << (ok ? "passed" : "failed");
 #endif
 
@@ -511,8 +548,8 @@ int main(int argc, char** argv)
   // test_case<tfloat32_t, tfloat32_t, float, 'R', 'C'>(Q, m, n, k);
   // test_case<tfloat32_t, tfloat32_t, float, 'C', 'R'>(Q, m, n, k);
 
-  test_case<half_t, half_t, float, 'R', 'R'>(Q, 64, 64, 64);
-  test_case<int8_t, int8_t, int32_t, 'R', 'R'>(Q, 64, 64, 64);
+  test_case<half_t, half_t, float, 'R', 'R'>(Q, m, n, k);
+  test_case<int8_t, int8_t, int32_t, 'R', 'R'>(Q, m, n, k);
   // test_case<half_t, half_t, float, 'R', 'C'>(Q, m, n, k);
   // test_case<half_t, half_t, float, 'C', 'R'>(Q, m, n, k);
 

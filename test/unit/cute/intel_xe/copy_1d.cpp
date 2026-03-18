@@ -67,15 +67,6 @@ void copy_kernel_vectorized(TensorS tile_S, TensorD tile_D) {
       cutlass::uint128_t, typename uint_bit<sizeof_bits_v<Element>>::type>>;
   using Atom_store = Copy_Atom<traits_store, Element>;
 
-  using traits_ldsm =
-      Copy_Traits<XE_1D_LDSM<typename uint_bit<sizeof_bits_v<Element>>::type,
-                             cutlass::uint128_t>>;
-  using Atom_ldsm = Copy_Atom<traits_ldsm, Element>;
-  using traits_stsm =
-      Copy_Traits<XE_1D_STSM<cutlass::uint128_t,
-                             typename uint_bit<sizeof_bits_v<Element>>::type>>;
-  using Atom_stsm = Copy_Atom<traits_stsm, Element>;
-
   // Construct tiled copy, a tiling of copy atoms.
   //
   // Note, this assumes the vector and thread layouts are aligned with contigous
@@ -95,29 +86,14 @@ void copy_kernel_vectorized(TensorS tile_S, TensorD tile_D) {
                       ThreadLayout, // thread layout
                       VecLayout);   // vector layout (e.g. 4x1)
 
-  auto tiled_ldsm = make_tiled_copy(Atom_ldsm{},  // access size
-                                    ThreadLayout, // thread layout
-                                    VecLayout);   // vector layout (e.g. 4x1)
-  auto tiled_stsm = make_tiled_copy(Atom_stsm{},  // access size
-                                    ThreadLayout, // thread layout
-                                    VecLayout);   // vector layout (e.g. 4x1)
-
   // Construct a Tensor corresponding to each thread's slice.
   auto thr_copy_load = tiled_copy_load.get_thread_slice(ThreadIdxX());
   auto thr_copy_store = tiled_copy_store.get_thread_slice(ThreadIdxX());
-
-  auto thr_copy_ldsm = tiled_ldsm.get_thread_slice(ThreadIdxX());
-  auto thr_copy_stsm = tiled_stsm.get_thread_slice(ThreadIdxX());
 
   Tensor thr_tile_load_S =
       thr_copy_load.partition_S(tile_S); // (CopyOp, CopyM, CopyN)
   Tensor thr_tile_store_D =
       thr_copy_store.partition_D(tile_D); // (CopyOp, CopyM, CopyN)
-
-  Tensor thr_tile_ldsm_S =
-      thr_copy_ldsm.partition_S(sTensor); // (CopyOp, CopyM, CopyN)
-  Tensor thr_tile_stsm_D =
-      thr_copy_stsm.partition_D(sTensor); // (CopyOp, CopyM, CopyN)
 
   // Construct a register-backed Tensor with the same shape as each thread's
   // partition Use make_fragment because the first mode is the instruction-local
@@ -151,9 +127,31 @@ void copy_kernel_vectorized(TensorS tile_S, TensorD tile_D) {
   // Copy from GMEM to RMEM and from RMEM to GMEM
   prefetch(tiled_copy_load, thr_tile_load_S);
   copy(tiled_copy_load, thr_tile_load_S, fragment);
-  copy(tiled_stsm, fragment, thr_tile_stsm_D);
+
+  constexpr int elements_per_access = sizeof(cutlass::uint128_t) / sizeof(Element);
+  constexpr int subgroup_size = SUBGROUP_SIZE;
+  int accesses_per_thread = int(size(fragment)) / elements_per_access;
+  int lane = int(ThreadIdxX());
+
+  for (int access_idx = 0; access_idx < accesses_per_thread; ++access_idx) {
+    for (int vec_idx = 0; vec_idx < elements_per_access; ++vec_idx) {
+      int linear_idx = access_idx * elements_per_access + vec_idx;
+      int smem_idx = access_idx * subgroup_size * elements_per_access +
+                     lane * elements_per_access + vec_idx;
+      XE_1D_STSM<Element>::copy(fragment[linear_idx], sTensor[smem_idx]);
+    }
+  }
+
   clear(fragment);
-  copy(tiled_ldsm, thr_tile_ldsm_S, fragment);
+  for (int access_idx = 0; access_idx < accesses_per_thread; ++access_idx) {
+    for (int vec_idx = 0; vec_idx < elements_per_access; ++vec_idx) {
+      int linear_idx = access_idx * elements_per_access + vec_idx;
+      int smem_idx = access_idx * subgroup_size * elements_per_access +
+                     lane * elements_per_access + vec_idx;
+      XE_1D_LDSM<Element>::copy(sTensor[smem_idx], fragment[linear_idx]);
+    }
+  }
+
   copy(tiled_copy_store, fragment, thr_tile_store_D);
 }
 
