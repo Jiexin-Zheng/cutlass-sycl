@@ -134,11 +134,28 @@ gemm_device(ATensor   const& A,         // (M,K)
   /* Create block 2D TiledCopies */
   using TA = typename ATensor::element_type;
   using TB = typename BTensor::element_type;
+  using MMA_TA = typename TiledMMA::ValTypeA;
+  using MMA_TB = typename TiledMMA::ValTypeB;
+  // Detect if copy type width differs from MMA type width
+  constexpr bool a_type_mismatch = !std::is_same_v<TA, MMA_TA>;
+  constexpr bool b_type_mismatch = !std::is_same_v<TB, MMA_TB>;
   auto coop_copy_a = make_coop_block_2d_copy_A(mma, A);
   auto coop_copy_b = make_coop_block_2d_copy_B(mma, B);
-  // TODO: generate proper subgroup tensors
-  auto coop_copy_a_ = make_coop_block_2d_copy_A(mma, make_tensor(A.data(), make_layout(shape(A), LayoutRight{})));
-  auto coop_copy_b_ = make_coop_block_2d_copy_B(mma, make_tensor(B.data(), make_layout(shape(B), LayoutRight{})));
+  // When copy type differs from MMA type (e.g. e4m3 -> half_t), build MMA-typed proxy tensor
+  // for the reorder destination coop copy, since reorder performs the type conversion.
+  // Otherwise, use the original copy-typed tensor.
+  auto coop_copy_a_ = [&]() {
+    if constexpr (a_type_mismatch)
+      return make_coop_block_2d_copy_A(mma, make_tensor(make_gmem_ptr(reinterpret_cast<MMA_TA const*>(&*A.data())), make_layout(shape(A), LayoutRight{})));
+    else
+      return make_coop_block_2d_copy_A(mma, make_tensor(A.data(), make_layout(shape(A), LayoutRight{})));
+  }();
+  auto coop_copy_b_ = [&]() {
+    if constexpr (b_type_mismatch)
+      return make_coop_block_2d_copy_B(mma, make_tensor(make_gmem_ptr(reinterpret_cast<MMA_TB const*>(&*B.data())), make_layout(shape(B), LayoutRight{})));
+    else
+      return make_coop_block_2d_copy_B(mma, make_tensor(B.data(), make_layout(shape(B), LayoutRight{})));
+  }();
   auto [r2s_A, s2r_A] = make_A_slm_copies(mma, coop_copy_a);
   auto [r2s_B, s2r_B] = make_B_slm_copies(mma, coop_copy_b);
   auto copy_c = make_block_2d_copy_D(mma, C);
@@ -148,8 +165,11 @@ gemm_device(ATensor   const& A,         // (M,K)
   Layout a_slm_layout = make_layout(append<3>(typename decltype(r2s_A)::Tiler_MN{}, Int<stages>{}));
   Layout b_slm_layout = make_layout(append<3>(typename decltype(r2s_B)::Tiler_MN{}, Int<stages>{}));
 
-  auto smemA = compat::local_mem<TA[size(a_slm_layout)]>();
-  auto smemB = compat::local_mem<TB[size(b_slm_layout)]>();
+  // SLM element type: use MMA type when it differs from copy type, otherwise copy type (original).
+  using SLM_TA = std::conditional_t<a_type_mismatch, MMA_TA, TA>;
+  using SLM_TB = std::conditional_t<b_type_mismatch, MMA_TB, TB>;
+  auto smemA = compat::local_mem<SLM_TA[size(a_slm_layout)]>();
+  auto smemB = compat::local_mem<SLM_TB[size(b_slm_layout)]>();
 
   Tensor sA = make_tensor(make_smem_ptr(smemA), a_slm_layout);
   Tensor sB = make_tensor(make_smem_ptr(smemB), b_slm_layout);
@@ -482,4 +502,6 @@ int main(int argc, const char** argv)
 
   test_case<uint4_t, uint4_t, uint32_t, 'R', 'C'>(Q, m, n, k, iterations, verify);
   test_case<uint4_t, uint4_t, uint32_t, 'R', 'R'>(Q, m, n, k, iterations, verify);
+  test_case<float_e4m3_t, float_e4m3_t, float, 'R', 'R'>(Q, m, n, k, iterations, verify);
+  test_case<float_e4m3_t, float_e4m3_t, float, 'R', 'C'>(Q, m, n, k, iterations, verify);
 }

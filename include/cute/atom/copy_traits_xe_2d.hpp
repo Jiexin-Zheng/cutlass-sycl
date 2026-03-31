@@ -1171,7 +1171,14 @@ make_slm_copy(SubgroupTensor<SEngine, SLayoutWI, SLayout> const& src,
   static_assert(rank(DLayout{}) >= 2, "Rank of dst tensor should be greater than 2");
   auto src_tv = composition(src.tv_layout(), make_layout(layout<0,0>(dst),layout<1,0>(dst)));
   constexpr uint32_t frg_size = size<1>(src_tv);
-  using XType = typename SEngine::value_type;
+  // When source and destination have different element types (e.g. after reorder/convert
+  // from a narrow copy type to a wider MMA type), use the destination (SLM) element type
+  // for the copy atom. Otherwise, preserve the original source-type behavior.
+  constexpr bool type_mismatch = !std::is_same_v<typename SEngine::value_type,
+                                                  typename DEngine::value_type>;
+  using XType = std::conditional_t<type_mismatch,
+                                   typename DEngine::value_type,
+                                   typename SEngine::value_type>;
   using PackedType = cutlass::AlignedArray<XType, frg_size>;
   using namespace intel;
   auto atom_r2s = Copy_Atom<UniversalCopy<PackedType>, XType>{};
@@ -1298,17 +1305,30 @@ make_A_slm_copies(TiledMMA  const& tiled_mma,
   auto sv_layout_t_ = make_layout(get<0>(sv_layout_t0_),
                                  filter(get<1>(sv_layout_t0_)));               // (SG,V') -> (M tile, K tile)
   auto tCrA = tiled_mma.get_slice(0).partition_sg_fragment_A(make_identity_tensor(tile_mk));
-  auto r2s = make_slm_copy(global_copy.get_slice(0).partition_sg_fragment_D(make_identity_tensor(tile_mk)), dummy_tensor,
-                         sv_layout_t_);
-  auto s2r = make_slm_copy(dummy_tensor, tCrA, sv_layout_t);
-  return std::tuple(r2s, s2r);
+  // Detect if the copy element type width differs from MMA element type width
+  // (e.g. 8-bit float_e4m3_t copy -> 16-bit half_t MMA).
+  using CopyValTypeA = typename TiledCopy::ValType;
+  constexpr bool type_width_mismatch = sizeof_bits_v<CopyValTypeA> != sizeof_bits_v<ValType>;
+  if constexpr (type_width_mismatch) {
+    // Type widths differ: after reorder/convert, register data is in MMA type.
+    // Use MMA-typed fragment for r2s to match SLM element size.
+    auto r2s = make_slm_copy(tCrA, dummy_tensor, sv_layout_t_);
+    auto s2r = make_slm_copy(dummy_tensor, tCrA, sv_layout_t);
+    return std::tuple(r2s, s2r);
+  } else {
+    // Original path: copy and MMA types have the same width.
+    auto r2s = make_slm_copy(global_copy.get_slice(0).partition_sg_fragment_D(make_identity_tensor(tile_mk)),
+                             dummy_tensor, sv_layout_t_);
+    auto s2r = make_slm_copy(dummy_tensor, tCrA, sv_layout_t);
+    return std::tuple(r2s, s2r);
+  }
 }
 
 template<class TiledMMA, class TiledCopy>
 CUTE_HOST_DEVICE
 constexpr auto
 make_B_slm_copies(TiledMMA  const& tiled_mma,
-                  TiledCopy const& global_copy)  // input TiledCopy for global A load
+                  TiledCopy const& global_copy)  // input TiledCopy for global B load
 {
   using SLM_Layout = decltype(make_B_slm_layout(tiled_mma));
   using ValType = typename TiledMMA::ValTypeB;
@@ -1348,10 +1368,23 @@ make_B_slm_copies(TiledMMA  const& tiled_mma,
   auto sv_layout_t_ = make_layout(get<0>(sv_layout_t0_),
                                  filter(get<1>(sv_layout_t0_)));                 // (SG,V') -> (M tile, K tile)
   auto tCrB = tiled_mma.get_slice(0).partition_sg_fragment_B(make_identity_tensor(tile_nk));
-  auto r2s = make_slm_copy(global_copy.get_slice(0).partition_sg_fragment_D(make_identity_tensor(tile_nk)), dummy_tensor,
-                           sv_layout_t_);
-  auto s2r = make_slm_copy(dummy_tensor, tCrB, sv_layout_t);
-  return std::tuple(r2s, s2r);
+  // Detect if the copy element type width differs from MMA element type width
+  // (e.g. 8-bit float_e4m3_t copy -> 16-bit half_t MMA).
+  using CopyValTypeB = typename TiledCopy::ValType;
+  constexpr bool type_width_mismatch = sizeof_bits_v<CopyValTypeB> != sizeof_bits_v<ValType>;
+  if constexpr (type_width_mismatch) {
+    // Type widths differ: after reorder/convert, register data is in MMA type.
+    // Use MMA-typed fragment for r2s to match SLM element size.
+    auto r2s = make_slm_copy(tCrB, dummy_tensor, sv_layout_t_);
+    auto s2r = make_slm_copy(dummy_tensor, tCrB, sv_layout_t);
+    return std::tuple(r2s, s2r);
+  } else {
+    // Original path: copy and MMA types have the same width.
+    auto r2s = make_slm_copy(global_copy.get_slice(0).partition_sg_fragment_D(make_identity_tensor(tile_nk)),
+                             dummy_tensor, sv_layout_t_);
+    auto s2r = make_slm_copy(dummy_tensor, tCrB, sv_layout_t);
+    return std::tuple(r2s, s2r);
+  }
 }
 
 // Variants of make_block_2d_copy_C/D where the C/D tile is further subdivided by the user.
