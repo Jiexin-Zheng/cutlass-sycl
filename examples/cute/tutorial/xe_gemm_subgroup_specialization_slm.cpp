@@ -144,11 +144,8 @@ gemm_device(ATensor   const& A,         // (M,K)
   using TB = typename BTensor::element_type;
   auto coop_copy_a = make_coop_block_2d_copy_A(mma, A);
   auto coop_copy_b = make_coop_block_2d_copy_B(mma, B);
-  // TODO: generate proper subgroup tensors
-  auto coop_copy_a_ = make_coop_block_2d_copy_A(mma, make_tensor(A.data(), make_layout(shape(A), LayoutRight{})));
-  auto coop_copy_b_ = make_coop_block_2d_copy_B(mma, make_tensor(B.data(), make_layout(shape(B), LayoutRight{})));
-  auto [r2s_A, s2r_A] = make_A_slm_copies(mma, coop_copy_a);
-  auto [r2s_B, s2r_B] = make_B_slm_copies(mma, coop_copy_b);
+  auto [r2s_A, s2r_A, reorder_tv_A] = make_A_slm_copies(mma, coop_copy_a, true_type{});
+  auto [r2s_B, s2r_B, reorder_tv_B] = make_B_slm_copies(mma, coop_copy_b, true_type{});
   auto copy_c = make_block_2d_copy_D(mma, C);
 
   // Shared memory buffers
@@ -166,8 +163,6 @@ gemm_device(ATensor   const& A,         // (M,K)
   auto thr_mma    =    mma.get_slice(local_id);
   auto coop_thr_copy_a = coop_copy_a.get_slice(local_id);
   auto coop_thr_copy_b = coop_copy_b.get_slice(local_id);
-  auto coop_thr_copy_a_ = coop_copy_a_.get_slice(local_id);
-  auto coop_thr_copy_b_ = coop_copy_b_.get_slice(local_id);
   auto thr_r2s_A = r2s_A.get_slice(local_id);
   auto thr_r2s_B = r2s_B.get_slice(local_id);
   auto thr_s2r_A = s2r_A.get_slice(local_id);
@@ -180,8 +175,8 @@ gemm_device(ATensor   const& A,         // (M,K)
   /* Register fragments for copies */
   auto tArA_in = coop_thr_copy_a.partition_sg_fragment_D(gA(_,_,0));
   auto tBrB_in = coop_thr_copy_b.partition_sg_fragment_D(gB(_,_,0));
-  auto tArA_in_ = coop_thr_copy_a_.partition_sg_fragment_D(gA(_,_,0));
-  auto tBrB_in_ = coop_thr_copy_b_.partition_sg_fragment_D(gB(_,_,0));
+  auto tArA_in_ = thr_r2s_A.partition_sg_fragment_S(sA(_,_,0), reorder_tv_A);
+  auto tBrB_in_ = thr_r2s_B.partition_sg_fragment_S(sB(_,_,0), reorder_tv_B);
   auto tAsA_out = thr_r2s_A.partition_D(sA);
   auto tBsB_out = thr_r2s_B.partition_D(sB);
   auto tArA_out = thr_r2s_A.retile_S(tArA_in_);

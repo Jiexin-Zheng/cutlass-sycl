@@ -1307,6 +1307,32 @@ make_A_slm_copies(TiledMMA  const& tiled_mma,
   return std::tuple(r2s, s2r);
 }
 
+// Extended overload that also returns the reorder destination TV layout,
+// so callers can create reorder destination fragments via
+// thr_r2s.partition_sg_fragment_S(smem_slice, reorder_tv) without needing
+// a separate coop_copy built from a dummy MMA-typed LayoutRight tensor.
+template<class TiledMMA, class TiledCopy, class ReorderTVTag,
+         __CUTE_REQUIRES(is_same_v<remove_cvref_t<ReorderTVTag>, true_type>)>
+CUTE_HOST_DEVICE
+constexpr auto
+make_A_slm_copies(TiledMMA     const& tiled_mma,
+                  TiledCopy    const& global_copy,
+                  ReorderTVTag const&)
+{
+  auto [r2s, s2r] = make_A_slm_copies(tiled_mma, global_copy);
+
+  using ValType = typename TiledMMA::ValTypeA;
+  auto tile_mk = select<0, 2>(tiled_mma.tile_mnk());
+  auto dummy_gmem = make_tensor(make_gmem_ptr(static_cast<ValType const*>(nullptr)),
+                                make_layout(tile_mk, LayoutRight{}));
+  auto reorder_coop_copy = make_coop_block_2d_copy_A(tiled_mma, dummy_gmem);
+  auto reorder_thr_copy = reorder_coop_copy.get_slice(0);
+  auto reorder_dst_tv = reorder_thr_copy.partition_sg_fragment_D(
+      make_identity_tensor(tile_mk)).tv_layout();
+
+  return std::tuple(r2s, s2r, reorder_dst_tv);
+}
+
 template<class TiledMMA, class TiledCopy>
 CUTE_HOST_DEVICE
 constexpr auto
@@ -1356,6 +1382,29 @@ make_B_slm_copies(TiledMMA  const& tiled_mma,
   auto r2s = make_slm_copy(tCrB, dummy_tensor, sv_layout_t_);
   auto s2r = make_slm_copy(dummy_tensor, tCrB, sv_layout_t);
   return std::tuple(r2s, s2r);
+}
+
+// Extended overload that also returns the reorder destination TV layout.
+template<class TiledMMA, class TiledCopy, class ReorderTVTag,
+         __CUTE_REQUIRES(is_same_v<remove_cvref_t<ReorderTVTag>, true_type>)>
+CUTE_HOST_DEVICE
+constexpr auto
+make_B_slm_copies(TiledMMA     const& tiled_mma,
+                  TiledCopy    const& global_copy,
+                  ReorderTVTag const&)
+{
+  auto [r2s, s2r] = make_B_slm_copies(tiled_mma, global_copy);
+
+  using ValType = typename TiledMMA::ValTypeB;
+  auto tile_nk = select<1, 2>(tiled_mma.tile_mnk());
+  auto dummy_gmem_b = make_tensor(make_gmem_ptr(static_cast<ValType const*>(nullptr)),
+                                  make_layout(tile_nk, LayoutRight{}));
+  auto reorder_coop_copy_b = make_coop_block_2d_copy_B(tiled_mma, dummy_gmem_b);
+  auto reorder_thr_copy_b = reorder_coop_copy_b.get_slice(0);
+  auto reorder_dst_tv = reorder_thr_copy_b.partition_sg_fragment_D(
+      make_identity_tensor(tile_nk)).tv_layout();
+
+  return std::tuple(r2s, s2r, reorder_dst_tv);
 }
 
 // Variants of make_block_2d_copy_C/D where the C/D tile is further subdivided by the user.

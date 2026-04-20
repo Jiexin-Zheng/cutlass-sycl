@@ -462,12 +462,28 @@ struct ThrCopy
                                 layout(atom_partition_S(stensor)));
   }
 
+  // Overload with explicit TV layout (e.g. for reorder destination fragments).
+  template <class STensor, class TVLayout>
+  CUTE_HOST_DEVICE
+  auto
+  partition_sg_fragment_S(STensor&& stensor, TVLayout const& tv_layout) const {
+    return make_subgroup_tensor(partition_fragment_S(stensor), tv_layout);
+  }
+
   template <class DTensor>
   CUTE_HOST_DEVICE
   auto
   partition_sg_fragment_D(DTensor&& dtensor) const {
     return make_subgroup_tensor(partition_fragment_D(dtensor),
                                 layout(atom_partition_D(dtensor)));
+  }
+
+  // Overload with explicit TV layout (e.g. for reorder destination fragments).
+  template <class DTensor, class TVLayout>
+  CUTE_HOST_DEVICE
+  auto
+  partition_sg_fragment_D(DTensor&& dtensor, TVLayout const& tv_layout) const {
+    return make_subgroup_tensor(partition_fragment_D(dtensor), tv_layout);
   }
 };
 
